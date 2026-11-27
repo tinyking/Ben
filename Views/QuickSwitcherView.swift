@@ -162,6 +162,7 @@ private struct QuickSwitcherRow: View {
 
 struct DocumentOutlineView: View {
     @Environment(AppState.self) private var app
+    var embedded = false
 
     private var activeHeadingLine: Int? {
         let cursor = app.editor.cursorLine
@@ -169,31 +170,54 @@ struct DocumentOutlineView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Label("文档大纲", systemImage: "list.bullet.indent")
-                    .font(.subheadline.weight(.semibold))
-                Spacer()
-                Button { app.dismissOverlay() } label: {
-                    Image(systemName: "xmark")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-                .keyboardShortcut(.escape, modifiers: [])
-                .help("关闭大纲 (Esc)")
+        Group {
+            if embedded {
+                outlineContent
+                    .padding(6)
+                    .frame(
+                        maxWidth: .infinity,
+                        maxHeight: .infinity,
+                        alignment: app.editor.outline.isEmpty ? .center : .topLeading
+                    )
+            } else {
+                outlineContent
+                    .padding(14)
+                    .frame(width: 290)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                    .overlay(RoundedRectangle(cornerRadius: 12).stroke(.quaternary, lineWidth: 1))
+                    .shadow(color: .black.opacity(0.16), radius: 18, y: 8)
             }
+        }
+    }
 
-            Divider()
+    private var outlineContent: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if !embedded {
+                HStack {
+                    Label("文档大纲", systemImage: "list.bullet.indent")
+                        .font(.subheadline.weight(.semibold))
+                    Spacer()
+                    Button { app.dismissOverlay() } label: {
+                        Image(systemName: "xmark")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .keyboardShortcut(.escape, modifiers: [])
+                    .help("关闭大纲 (Esc)")
+                }
+
+                Divider()
+            }
 
             if app.editor.outline.isEmpty {
                 VStack(spacing: 6) {
                     Text("这篇笔记还没有标题")
                         .font(.callout)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(embedded ? Color.white.opacity(0.56) : Color.secondary)
                     Text("使用 #、##、### 创建章节结构")
                         .font(.caption)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(embedded ? Color.white.opacity(0.36) : Color.secondary.opacity(0.7))
                 }
                 .frame(maxWidth: .infinity, minHeight: 100)
             } else {
@@ -202,7 +226,8 @@ struct DocumentOutlineView: View {
                         ForEach(app.editor.outline) { heading in
                             OutlineItemRow(
                                 heading: heading,
-                                isActive: heading.line == activeHeadingLine
+                                isActive: heading.line == activeHeadingLine,
+                                embedded: embedded
                             ) {
                                 if let url = app.editor.currentNote {
                                     app.editor.scrollRequest = EditorState.ScrollRequest(
@@ -210,50 +235,80 @@ struct DocumentOutlineView: View {
                                         line: heading.line
                                     )
                                 }
-                                app.dismissOverlay()
+                                if !embedded {
+                                    app.dismissOverlay()
+                                }
                             }
                         }
                     }
                 }
-                .frame(maxHeight: 420)
+                .scrollContentBackground(.hidden)
+                .frame(maxHeight: embedded ? .infinity : 420)
             }
         }
-        .padding(14)
-        .frame(width: 290)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12).stroke(.quaternary, lineWidth: 1))
-        .shadow(color: .black.opacity(0.16), radius: 18, y: 8)
     }
 }
 
 private struct OutlineItemRow: View {
     let heading: OutlineEntry
     let isActive: Bool
+    var embedded = false
     let action: () -> Void
     @State private var isHovered = false
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 6) {
+            HStack(spacing: 7) {
                 Circle()
-                    .fill(isActive ? Color.accentColor : Color.clear)
-                    .frame(width: 5, height: 5)
+                    .fill(dotFill)
+                    .frame(width: 5.5, height: 5.5)
+                    .overlay(
+                        Circle()
+                            .stroke(isActive ? Color.clear : Color.white.opacity(0.28), lineWidth: 0.9)
+                    )
+
                 Text(heading.title)
-                    .font(heading.level <= 2 ? .callout.weight(.semibold) : .callout)
-                    .foregroundStyle(isActive ? Color.accentColor : .primary)
+                    .font(titleFont)
+                    .foregroundStyle(titleColor)
                     .lineLimit(1)
                     .padding(.leading, CGFloat(max(0, heading.level - 1)) * 11)
+
                 Spacer(minLength: 0)
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
-            .background(
-                isActive ? Color.accentColor.opacity(0.12) : (isHovered ? Color.primary.opacity(0.06) : Color.clear),
-                in: RoundedRectangle(cornerRadius: 6)
-            )
-            .contentShape(Rectangle())
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(rowBackground, in: Capsule())
+            .contentShape(Capsule())
         }
         .buttonStyle(.plain)
         .onHover { isHovered = $0 }
+    }
+
+    private var dotFill: Color {
+        guard isActive else { return .clear }
+        return embedded ? Color.orange : Color.accentColor
+    }
+
+    private var titleFont: Font {
+        if isActive {
+            return .callout.weight(.bold)
+        }
+        return heading.level <= 2 ? .callout.weight(.medium) : .callout
+    }
+
+    private var titleColor: Color {
+        if embedded {
+            return isActive ? .white : .white.opacity(0.78)
+        }
+        return isActive ? Color.accentColor : .primary
+    }
+
+    private var rowBackground: Color {
+        if embedded {
+            if isActive { return .white.opacity(0.14) }
+            return isHovered ? .white.opacity(0.07) : .clear
+        }
+        if isActive { return Color.accentColor.opacity(0.14) }
+        return isHovered ? Color.primary.opacity(0.06) : .clear
     }
 }

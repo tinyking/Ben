@@ -26,3 +26,25 @@ targets:
         CFBundleName: Ben
         LSMinimumSystemVersion: '14.0'
         NSHighResolutionCapable: true
+
+  BenTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests
+    dependencies:
+      - target: Ben
+    settings:
+      GENERATE_INFOPLIST_FILE: 'YES'
+      BUNDLE_LOADER: '$(TEST_HOST)'
+      TEST_HOST: '$(BUILT_PRODUCTS_DIR)/Ben.app/Contents/MacOS/Ben'
+
+schemes:
+  Ben:
+    build:
+      targets:
+        Ben: all
+        BenTests: [test]
+    test:
+      targets:
+        - BenTests

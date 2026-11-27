@@ -17,15 +17,15 @@ struct BenApp: App {
         WindowGroup {
             MainView()
                 .environment(app)
-                .preferredColorScheme(colorScheme)
-                .onAppear { app.bootstrap() }
+                .preferredColorScheme(app.vaultStore.vaultURL == nil ? colorScheme : .dark)
+                .onAppear { DispatchQueue.main.async { app.bootstrap() } }
                 .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
                     app.checkVaultHealth()
                     app.editor.reloadFromDiskIfNeeded()
                 }
         }
         .defaultSize(width: 1140, height: 740)
-        .windowToolbarStyle(.unified)
+        .windowStyle(.hiddenTitleBar)
         .commands {
             CommandGroup(replacing: .newItem) {}
 

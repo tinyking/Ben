@@ -1,7 +1,8 @@
 import SwiftUI
 import AppKit
+import CoreText
 
-/// 统一承载「所见即所得（类 Bear 风格）」与「纯源码」两种模式的编辑器视图。
+/// 统一承载「所见即所得」与「纯源码」两种模式的编辑器视图。
 struct MarkdownEditorView: View {
     @Environment(AppState.self) private var app
     @AppStorage("proseFontName") private var proseFontName = "System"
@@ -17,16 +18,21 @@ struct MarkdownEditorView: View {
             }
 
             MarkdownCanvasRepresentable(
+                app: app,
                 text: Binding(
                     get: { app.editor.text },
                     set: { app.editor.updateTextFromUser($0) }
                 ),
+                frontmatter: app.editor.frontmatter,
+                isFrontmatterExpanded: app.editor.isFrontmatterExpanded,
                 styleConfig: MarkdownStyler.StyleConfig(
                     mode: app.editor.mode,
                     proseFontName: proseFontName,
                     codeFontName: codeFontName,
                     fontSize: CGFloat(fontSize),
-                    lineSpacing: CGFloat(lineSpacing)
+                    lineSpacing: CGFloat(lineSpacing),
+                    noteURL: app.editor.currentNote,
+                    vaultURL: app.vaultStore.vaultURL
                 ),
                 comfortableLineWidth: comfortableLineWidth,
                 scrollRequest: app.editor.scrollRequest,
@@ -36,6 +42,8 @@ struct MarkdownEditorView: View {
                     app.editor.cursorColumn = column
                 }
             )
+            .padding(.top, 12)
+            .background(Color.white)
             .overlay(alignment: .top) {
                 if let line = app.editor.highlightedLine, !app.editor.highlightedQuery.isEmpty {
                     matchBanner(line: line)
@@ -49,7 +57,7 @@ struct MarkdownEditorView: View {
         }
     }
 
-    // MARK: - 类 Bear 顶部轻量格式栏
+    // MARK: - 顶部轻量格式栏
 
     private var formattingToolbar: some View {
         HStack(spacing: 2) {
@@ -114,8 +122,10 @@ struct MarkdownEditorView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 5)
-        .background(.bar)
-        .overlay(alignment: .bottom) { Divider() }
+        .background(Color.white)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(Color.black.opacity(0.07)).frame(height: 1)
+        }
     }
 
     // MARK: - 搜索跳转提示横幅
@@ -124,11 +134,12 @@ struct MarkdownEditorView: View {
         let lines = app.editor.text.components(separatedBy: "\n")
         let lineText = lines.indices.contains(line - 1) ? lines[line - 1] : ""
         let query = app.editor.highlightedQuery
+        let physicalLine = line + app.editor.frontmatterLineOffset
 
         return HStack(spacing: 8) {
             Image(systemName: "text.cursor")
                 .foregroundStyle(Color.accentColor)
-            Text("第 \(line) 行")
+            Text("第 \(physicalLine) 行")
                 .fontWeight(.semibold)
             highlighted(lineText.trimmingCharacters(in: .whitespaces), query: query)
                 .lineLimit(1)
@@ -190,10 +201,30 @@ private struct FormatToolbarButton: View {
     }
 }
 
-// MARK: - 原生 AppKit NSTextView 封装（支持中文拼音输入法保护、Undo/Redo、列表自动续行、待办点击切换、居中舒适版心）
+/// 当前挂载中的编辑器视图注册表。
+/// PDF 导出复用这份已排版好的视图，而不是从 Markdown 源码重新解析，
+/// 从而保证导出的效果与用户看到的所见即所得完全一致。
+enum BenEditorViewRegistry {
+    private static weak var currentView: NSTextView?
+
+    static var current: NSTextView? { currentView }
+
+    static func register(_ view: NSTextView) {
+        if currentView !== view { currentView = view }
+    }
+
+    static func unregister(_ view: NSTextView) {
+        if currentView === view { currentView = nil }
+    }
+}
+
+// MARK: - 原生 AppKit NSTextView 封装（支持中文拼音输入法保护、Undo/Redo、列表自动续行、待办点击切换、满宽分割线与块装饰绘制）
 
 private struct MarkdownCanvasRepresentable: NSViewRepresentable {
+    let app: AppState
     @Binding var text: String
+    let frontmatter: FrontmatterDocument?
+    let isFrontmatterExpanded: Bool
     let styleConfig: MarkdownStyler.StyleConfig
     let comfortableLineWidth: Bool
     let scrollRequest: EditorState.ScrollRequest?
@@ -206,6 +237,10 @@ private struct MarkdownCanvasRepresentable: NSViewRepresentable {
         scrollView.hasHorizontalScroller = false
         scrollView.drawsBackground = true
         scrollView.backgroundColor = .textBackgroundColor
+        // 所见即所得与源码模式共用此滚动容器：底部留 20pt 空白，
+        // 避免正文最后一行滚到底时紧贴状态栏横线。
+        scrollView.automaticallyAdjustsContentInsets = false
+        scrollView.contentInsets = NSEdgeInsets(top: 0, left: 0, bottom: 20, right: 0)
         ScrollbarStyleProbe.configureOverlayScrollbars(scrollView)
 
         let textView = BenEditorTextView()
@@ -221,16 +256,23 @@ private struct MarkdownCanvasRepresentable: NSViewRepresentable {
         textView.autoresizingMask = [.width]
         textView.drawsBackground = true
         textView.backgroundColor = .textBackgroundColor
+        textView.appearance = NSAppearance(named: .aqua)
         textView.insertionPointColor = .controlAccentColor
         textView.textContainer?.widthTracksTextView = true
         textView.textContainer?.lineFragmentPadding = 0
         textView.comfortableLineWidth = comfortableLineWidth
+        textView.onFocusChanged = { [weak coordinator = context.coordinator] in
+            coordinator?.refreshActiveLineIfNeeded(force: true)
+        }
         textView.delegate = context.coordinator
+        textView.layoutManager?.delegate = context.coordinator
         textView.string = text
+        textView.updateHeaderAccessory(app: app, hasFrontmatter: frontmatter != nil)
 
         scrollView.documentView = textView
         context.coordinator.textView = textView
         context.coordinator.currentConfig = styleConfig
+        context.coordinator.installImageReloadObserver()
         context.coordinator.applyStylesNow()
         return scrollView
     }
@@ -243,8 +285,9 @@ private struct MarkdownCanvasRepresentable: NSViewRepresentable {
 
         if textView.comfortableLineWidth != comfortableLineWidth {
             textView.comfortableLineWidth = comfortableLineWidth
-            textView.updateReadableInsets()
         }
+        textView.updateHeaderAccessory(app: app, hasFrontmatter: frontmatter != nil)
+        textView.updateReadableInsets()
 
         var needsRestyle = false
         if coordinator.currentConfig != styleConfig {
@@ -291,7 +334,7 @@ private struct MarkdownCanvasRepresentable: NSViewRepresentable {
 
     // MARK: - Coordinator
 
-    final class Coordinator: NSObject, NSTextViewDelegate {
+    final class Coordinator: NSObject, NSTextViewDelegate, NSLayoutManagerDelegate {
         var text: Binding<String>
         var currentConfig: MarkdownStyler.StyleConfig
         var onCursorPosition: (Int, Int) -> Void
@@ -299,7 +342,10 @@ private struct MarkdownCanvasRepresentable: NSViewRepresentable {
         var lastScrollToken: UUID?
         var lastFormatToken: UUID?
         var isApplyingExternalText = false
+        private var isApplyingStyles = false
+        private var lastActiveLineSignature: NSRange = NSRange(location: NSNotFound, length: 0)
         private var highlightWorkItem: DispatchWorkItem?
+        private var imageLoadObserver: NSObjectProtocol?
 
         init(
             text: Binding<String>,
@@ -309,6 +355,117 @@ private struct MarkdownCanvasRepresentable: NSViewRepresentable {
             self.text = text
             self.currentConfig = config
             self.onCursorPosition = onCursorPosition
+        }
+
+        deinit {
+            if let imageLoadObserver {
+                NotificationCenter.default.removeObserver(imageLoadObserver)
+            }
+        }
+
+        func installImageReloadObserver() {
+            guard imageLoadObserver == nil else { return }
+            imageLoadObserver = NotificationCenter.default.addObserver(
+                forName: .benMarkdownImageDidLoad,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                self?.applyStylesNow(forceInvalidateLayout: true)
+            }
+        }
+
+        // MARK: - NSLayoutManagerDelegate
+
+        /// 非光标行的无序列表标记 `-` / `*` / `+` 用圆点 `•` 的字形绘制。
+        /// 仅替换字形，不改字符与 characterIndexes，因此光标位置、选中范围与复制出的文本完全不变。
+        func layoutManager(
+            _ layoutManager: NSLayoutManager,
+            shouldGenerateGlyphs glyphs: UnsafePointer<CGGlyph>,
+            properties props: UnsafePointer<NSLayoutManager.GlyphProperty>,
+            characterIndexes: UnsafePointer<Int>,
+            font: NSFont,
+            forGlyphRange glyphRange: NSRange
+        ) -> Int {
+            guard let storage = layoutManager.textStorage, glyphRange.length > 0 else { return 0 }
+
+            // 先快速判定本字形范围是否含列表标记，绝大多数行直接返回 0 走系统默认字形。
+            var needsReplacement = false
+            for offset in 0..<glyphRange.length {
+                let charIndex = characterIndexes[offset]
+                if charIndex < storage.length,
+                   storage.attribute(.benBulletGlyph, at: charIndex, effectiveRange: nil) != nil {
+                    needsReplacement = true
+                    break
+                }
+            }
+            guard needsReplacement else { return 0 }
+
+            var bulletGlyph = CGGlyph(0)
+            let glyphFound = Array("•".utf16).withUnsafeBufferPointer { chars in
+                CTFontGetGlyphsForCharacters(font as CTFont, chars.baseAddress!, &bulletGlyph, 1)
+            }
+            guard glyphFound else { return 0 }
+
+            var replaced = Array(UnsafeBufferPointer(start: glyphs, count: glyphRange.length))
+            for offset in 0..<glyphRange.length {
+                let charIndex = characterIndexes[offset]
+                if charIndex < storage.length,
+                   storage.attribute(.benBulletGlyph, at: charIndex, effectiveRange: nil) != nil {
+                    replaced[offset] = bulletGlyph
+                }
+            }
+            replaced.withUnsafeBufferPointer { buffer in
+                layoutManager.setGlyphs(
+                    buffer.baseAddress!,
+                    properties: props,
+                    characterIndexes: characterIndexes,
+                    font: font,
+                    forGlyphRange: glyphRange
+                )
+            }
+            return glyphRange.length
+        }
+
+        /// 为含图片的段落最后一个行片段自动撑开真实图片渲染高度。
+        func layoutManager(
+            _ layoutManager: NSLayoutManager,
+            shouldSetLineFragmentRect lineFragmentRect: UnsafeMutablePointer<NSRect>,
+            lineFragmentUsedRect: UnsafeMutablePointer<NSRect>,
+            baselineOffset: UnsafeMutablePointer<CGFloat>,
+            in textContainer: NSTextContainer,
+            forGlyphRange glyphRange: NSRange
+        ) -> Bool {
+            guard let storage = layoutManager.textStorage, storage.length > 0 else { return false }
+            let charRange = layoutManager.characterRange(forGlyphRange: glyphRange, actualGlyphRange: nil)
+            guard charRange.location < storage.length,
+                  let spec = storage.attribute(.benImageAttachment, at: charRange.location, effectiveRange: nil) as? BenImageLayoutSpec else {
+                return false
+            }
+
+            let ns = storage.string as NSString
+            let paraRange = ns.lineRange(for: NSRange(location: charRange.location, length: 0))
+            let hasNewline = paraRange.length > 0 && ns.character(at: paraRange.location + paraRange.length - 1) == 10
+            let contentEnd = paraRange.location + paraRange.length - (hasNewline ? 1 : 0)
+
+            // 若当前行因超长 URL 折成多行，仅在该段落最后一个视觉行片段下方追加图片高度
+            guard charRange.location + charRange.length >= contentEnd else { return false }
+
+            let availableWidth = max(120, textContainer.containerSize.width)
+            let imageBlockHeight = spec.totalBlockHeight(availableWidth: availableWidth)
+            guard imageBlockHeight > 0 else { return false }
+
+            if spec.isStandaloneLine && !spec.isLineActive {
+                lineFragmentRect.pointee.size.height = imageBlockHeight
+                lineFragmentUsedRect.pointee.size.height = imageBlockHeight
+                lineFragmentUsedRect.pointee.size.width = availableWidth
+                baselineOffset.pointee = 12
+            } else {
+                let textHeight = lineFragmentRect.pointee.size.height
+                lineFragmentRect.pointee.size.height = textHeight + imageBlockHeight
+                lineFragmentUsedRect.pointee.size.height = textHeight + imageBlockHeight
+                lineFragmentUsedRect.pointee.size.width = max(lineFragmentUsedRect.pointee.size.width, availableWidth)
+            }
+            return true
         }
 
         func textDidChange(_ notification: Notification) {
@@ -321,7 +478,37 @@ private struct MarkdownCanvasRepresentable: NSViewRepresentable {
         }
 
         func textViewDidChangeSelection(_ notification: Notification) {
+            guard !isApplyingStyles, let textView, !textView.hasMarkedText() else { return }
             updateCursorPosition()
+            // 仅当活动行真的改变时才安排重排，且复用 textDidChange 的同一条防抖任务。
+            // 原先这里直接同步 applyStylesNow，与 35ms 后的 textDidChange 重排叠加，
+            // 一次跨行输入会全篇重排两次，在 418 行 / 63 条分割线的文档上表现为可见闪动。
+            let signature = computeActiveLineSignature(in: textView)
+            if signature != lastActiveLineSignature {
+                lastActiveLineSignature = signature
+                scheduleHighlight()
+            }
+        }
+
+        func refreshActiveLineIfNeeded(force: Bool) {
+            guard let textView, !textView.hasMarkedText() else { return }
+            let signature = computeActiveLineSignature(in: textView)
+            if force || signature != lastActiveLineSignature {
+                lastActiveLineSignature = signature
+                applyStylesNow()
+            }
+        }
+
+        private func computeActiveLineSignature(in textView: NSTextView) -> NSRange {
+            guard textView.window?.firstResponder === textView else {
+                return NSRange(location: NSNotFound, length: 0)
+            }
+            let ns = textView.string as NSString
+            guard ns.length > 0 else { return NSRange(location: 0, length: 0) }
+            let sel = textView.selectedRange()
+            let clampedLoc = min(max(0, sel.location), ns.length)
+            let clampedLen = min(max(0, sel.length), ns.length - clampedLoc)
+            return ns.lineRange(for: NSRange(location: clampedLoc, length: clampedLen))
         }
 
         /// 拦截回车键：支持无序列表、递增有序列表、待办清单与引用块的自动续行或空行退出。
@@ -355,7 +542,7 @@ private struct MarkdownCanvasRepresentable: NSViewRepresentable {
                 return true
             }
 
-            // 匹配普通列表或有序列表
+            // 匹配普通无序列表或有序列表（严格要求符号后紧跟空格）
             if let listRegex = try? NSRegularExpression(pattern: #"^([ \t]*)([-*+]|[0-9]+[.)])[ \t]+(.*)$"#),
                let match = listRegex.firstMatch(in: typedLine, range: NSRange(location: 0, length: (typedLine as NSString).length)) {
                 let indent = (typedLine as NSString).substring(with: match.range(at: 1))
@@ -421,7 +608,6 @@ private struct MarkdownCanvasRepresentable: NSViewRepresentable {
             let sel = textView.selectedRange()
             let mLen = (marker as NSString).length
 
-            // 若选区外侧紧邻 marker，则剥离
             if sel.location >= mLen,
                sel.location + sel.length + mLen <= ns.length,
                ns.substring(with: NSRange(location: sel.location - mLen, length: mLen)) == marker,
@@ -433,7 +619,6 @@ private struct MarkdownCanvasRepresentable: NSViewRepresentable {
                 return
             }
 
-            // 若选区本身首尾包含 marker，也剥离
             if sel.length >= mLen * 2 {
                 let selectedText = ns.substring(with: sel)
                 if selectedText.hasPrefix(marker) && selectedText.hasSuffix(marker) {
@@ -559,24 +744,63 @@ private struct MarkdownCanvasRepresentable: NSViewRepresentable {
                 self?.applyStylesNow()
             }
             highlightWorkItem = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(45), execute: work)
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(35), execute: work)
         }
 
-        func applyStylesNow() {
+        func applyStylesNow(forceInvalidateLayout: Bool = false) {
             guard let textView, !textView.hasMarkedText(), let storage = textView.textStorage else { return }
+            isApplyingStyles = true
+            defer { isApplyingStyles = false }
+
             let selectedRanges = textView.selectedRanges
-            MarkdownStyler.apply(to: storage, config: currentConfig)
+            let activeRanges: [NSRange] = (textView.window?.firstResponder === textView)
+                ? selectedRanges.map(\.rangeValue)
+                : []
+
+            lastActiveLineSignature = computeActiveLineSignature(in: textView)
+            MarkdownStyler.apply(to: storage, config: currentConfig, activeRanges: activeRanges)
+            if storage.length > 0 {
+                var hasAnyImage = forceInvalidateLayout
+                if !hasAnyImage {
+                    storage.enumerateAttribute(.benImageAttachment, in: NSRange(location: 0, length: storage.length), options: []) { val, _, stop in
+                        if val != nil {
+                            hasAnyImage = true
+                            stop.pointee = true
+                        }
+                    }
+                }
+                if hasAnyImage {
+                    textView.layoutManager?.invalidateLayout(
+                        forCharacterRange: NSRange(location: 0, length: storage.length),
+                        actualCharacterRange: nil
+                    )
+                }
+            }
             textView.selectedRanges = selectedRanges
+
             let typingFont = currentConfig.mode == .wysiwyg
                 ? MarkdownStyler.resolveProseFont(name: currentConfig.proseFontName, size: currentConfig.fontSize)
                 : MarkdownStyler.resolveCodeFont(name: currentConfig.codeFontName, size: currentConfig.fontSize)
-            let typingPara = NSMutableParagraphStyle()
-            typingPara.lineSpacing = currentConfig.lineSpacing
+
+            // 保持当前光标所在段落的 paragraphStyle，杜绝打字瞬间覆盖缩进或行距导致串位
+            let currentParagraphStyle: NSParagraphStyle = {
+                guard storage.length > 0 else {
+                    return MarkdownStyler.makeBaseParagraphStyle(config: currentConfig)
+                }
+                let probeIndex = min(max(0, textView.selectedRange().location), storage.length - 1)
+                if let para = storage.attribute(.paragraphStyle, at: probeIndex, effectiveRange: nil) as? NSParagraphStyle {
+                    return para
+                }
+                return MarkdownStyler.makeBaseParagraphStyle(config: currentConfig)
+            }()
+
             textView.typingAttributes = [
                 .font: typingFont,
                 .foregroundColor: NSColor.labelColor,
-                .paragraphStyle: typingPara
+                .paragraphStyle: currentParagraphStyle
             ]
+            // 不调用 needsDisplay：storage.setAttributes 已让 layoutManager 精确失效并重绘脏区。
+            // 对含大量自定义绘制（分割线/引用竖线/代码块底板）的长文，整视图重绘会造成明显闪烁。
         }
 
         private func updateCursorPosition() {
@@ -590,10 +814,53 @@ private struct MarkdownCanvasRepresentable: NSViewRepresentable {
     }
 }
 
-/// 自定义 NSTextView：支持自适应居中阅读版心，以及在点击 `- [ ]` 复选框时直接切换完成状态。
+/// 自定义 NSTextView：
+/// 1. 自适应居中阅读版心（740pt）；
+/// 2. 原生绘制满宽居中 1pt 水平分割线、引用块左侧竖线与连续围栏代码块圆角底板；
+/// 3. 点击 `- [ ]` 复选框直接切换完成状态。
 private final class BenEditorTextView: NSTextView {
     var comfortableLineWidth = true
+    var onFocusChanged: (() -> Void)?
     private let maxReadableWidth: CGFloat = 740
+    private var headerHostingView: NSHostingView<FrontmatterBarView>?
+    private var currentHorizontalInset: CGFloat = 36
+    private var currentTopOriginY: CGFloat = 14
+    private var headerHeight: CGFloat = 0
+
+    override var textContainerOrigin: NSPoint {
+        NSPoint(x: currentHorizontalInset, y: currentTopOriginY)
+    }
+
+    override func resetCursorRects() {
+        var textRect = visibleRect
+        if headerHeight > 0 {
+            let headerBottom = headerHeight + 14
+            if textRect.minY < headerBottom {
+                let delta = min(textRect.height, headerBottom - textRect.minY)
+                textRect.origin.y += delta
+                textRect.size.height -= delta
+            }
+        }
+        if textRect.height > 0 {
+            addCursorRect(textRect, cursor: .iBeam)
+        }
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        let ok = super.becomeFirstResponder()
+        if ok {
+            DispatchQueue.main.async { [weak self] in self?.onFocusChanged?() }
+        }
+        return ok
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let ok = super.resignFirstResponder()
+        if ok {
+            DispatchQueue.main.async { [weak self] in self?.onFocusChanged?() }
+        }
+        return ok
+    }
 
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
@@ -603,6 +870,37 @@ private final class BenEditorTextView: NSTextView {
     override func viewDidMoveToSuperview() {
         super.viewDidMoveToSuperview()
         updateReadableInsets()
+        if superview != nil {
+            BenEditorViewRegistry.register(self)
+        } else {
+            BenEditorViewRegistry.unregister(self)
+        }
+    }
+
+    override func removeFromSuperview() {
+        super.removeFromSuperview()
+        BenEditorViewRegistry.unregister(self)
+    }
+
+    func updateHeaderAccessory(app: AppState, hasFrontmatter: Bool) {
+        if hasFrontmatter {
+            let hosting: NSHostingView<FrontmatterBarView>
+            if let existing = headerHostingView {
+                existing.rootView = FrontmatterBarView(app: app)
+                hosting = existing
+            } else {
+                let created = NSHostingView(rootView: FrontmatterBarView(app: app))
+                // 保留默认 sizingOptions（intrinsicContentSize），否则 fittingSize 只返回
+                // 约 12pt 的最小高度，属性栏会被压扁并裁掉字段内容。
+                addSubview(created)
+                headerHostingView = created
+                hosting = created
+            }
+            hosting.isHidden = false
+        } else {
+            headerHostingView?.isHidden = true
+            headerHeight = 0
+        }
     }
 
     func updateReadableInsets() {
@@ -613,9 +911,244 @@ private final class BenEditorTextView: NSTextView {
         } else {
             horizontalInset = 36
         }
-        let targetInset = NSSize(width: max(28, horizontalInset), height: 28)
+        let clampedX = max(28, horizontalInset)
+        let columnWidth = max(200, availableWidth - clampedX * 2)
+
+        var measuredHeader: CGFloat = 0
+        if let hosting = headerHostingView, !hosting.isHidden {
+            hosting.frame.size.width = columnWidth
+            hosting.layoutSubtreeIfNeeded()
+            measuredHeader = ceil(hosting.fittingSize.height)
+            let targetFrame = NSRect(x: clampedX, y: 2, width: columnWidth, height: measuredHeader)
+            if hosting.frame != targetFrame {
+                hosting.frame = targetFrame
+            }
+        }
+        headerHeight = measuredHeader
+
+        let topOrigin: CGFloat = measuredHeader > 0 ? (2 + measuredHeader + 14) : 10
+        let bottomPadding: CGFloat = 32
+        let symmetricInsetHeight = ceil((topOrigin + bottomPadding) / 2)
+        let targetInset = NSSize(width: clampedX, height: symmetricInsetHeight)
+
+        let originChanged = currentHorizontalInset != clampedX || currentTopOriginY != topOrigin
+        currentHorizontalInset = clampedX
+        currentTopOriginY = topOrigin
+
         if textContainerInset != targetInset {
             textContainerInset = targetInset
+        } else if originChanged {
+            if let layoutManager, let textContainer {
+                layoutManager.textContainerChangedGeometry(textContainer)
+            }
+            window?.invalidateCursorRects(for: self)
+            needsDisplay = true
+        }
+    }
+
+    override func drawBackground(in rect: NSRect) {
+        super.drawBackground(in: rect)
+        drawMarkdownBlockDecorations(in: rect)
+    }
+
+    private func drawMarkdownBlockDecorations(in dirtyRect: NSRect) {
+        guard let layoutManager,
+              let textContainer,
+              let storage = textStorage,
+              storage.length > 0 else { return }
+
+        let origin = textContainerOrigin
+        let containerRect = dirtyRect.offsetBy(dx: -origin.x, dy: -origin.y).insetBy(dx: 0, dy: -24)
+        let glyphRange = layoutManager.glyphRange(forBoundingRect: containerRect, in: textContainer)
+        guard glyphRange.length > 0 else { return }
+
+        let contentLeft = origin.x
+        let contentWidth = max(40, textContainer.containerSize.width)
+
+        var pendingCodeBlockRect: NSRect?
+        func flushCodeBlock() {
+            guard let blockRect = pendingCodeBlockRect else { return }
+            let padded = NSRect(
+                x: contentLeft - 10,
+                y: blockRect.minY - 3,
+                width: contentWidth + 20,
+                height: blockRect.height + 6
+            )
+            let path = NSBezierPath(roundedRect: padded, xRadius: 7, yRadius: 7)
+            NSColor.black.withAlphaComponent(0.042).setFill()
+            path.fill()
+            NSColor.black.withAlphaComponent(0.065).setStroke()
+            path.lineWidth = 1
+            path.stroke()
+            pendingCodeBlockRect = nil
+        }
+
+        var glyphIndex = glyphRange.location
+        let endGlyph = glyphRange.location + glyphRange.length
+
+        while glyphIndex < endGlyph {
+            var lineGlyphRange = NSRange(location: 0, length: 0)
+            let lineFrag = layoutManager.lineFragmentRect(forGlyphAt: glyphIndex, effectiveRange: &lineGlyphRange)
+            let charIndex = layoutManager.characterIndexForGlyph(at: glyphIndex)
+
+            if charIndex < storage.length {
+                let attrs = storage.attributes(at: charIndex, effectiveRange: nil)
+                let viewLineRect = NSRect(
+                    x: contentLeft,
+                    y: origin.y + lineFrag.minY,
+                    width: contentWidth,
+                    height: lineFrag.height
+                )
+
+                // 1. 连续代码块圆角底板聚合
+                if attrs[.benCodeBlock] != nil {
+                    if let existing = pendingCodeBlockRect {
+                        pendingCodeBlockRect = existing.union(viewLineRect)
+                    } else {
+                        pendingCodeBlockRect = viewLineRect
+                    }
+                } else {
+                    flushCodeBlock()
+                }
+
+                // 2. 居中满宽 1pt 浅灰水平分割线
+                if (attrs[.benHorizontalRule] as? Bool) == true {
+                    let midY = floor(viewLineRect.midY) + 0.5
+                    let rulePath = NSBezierPath()
+                    rulePath.move(to: NSPoint(x: contentLeft, y: midY))
+                    rulePath.line(to: NSPoint(x: contentLeft + contentWidth, y: midY))
+                    rulePath.lineWidth = 1.0
+                    let isEditingLine = attrs[.benHiddenSyntax] == nil
+                    NSColor.black.withAlphaComponent(isEditingLine ? 0.08 : 0.14).setStroke()
+                    rulePath.stroke()
+                }
+
+                // 3. 引用块左侧竖线（支持多级嵌套 >>）
+                if let depth = attrs[.benBlockquoteDepth] as? Int, depth > 0 {
+                    for level in 1...depth {
+                        let barX = contentLeft + CGFloat(level - 1) * 16 + 2
+                        let barRect = NSRect(
+                            x: barX,
+                            y: viewLineRect.minY + 1,
+                            width: 3,
+                            height: max(4, viewLineRect.height - 2)
+                        )
+                        let barPath = NSBezierPath(roundedRect: barRect, xRadius: 1.5, yRadius: 1.5)
+                        NSColor.black.withAlphaComponent(0.16).setFill()
+                        barPath.fill()
+                    }
+                }
+
+                // 4. 所见即所得内嵌图片与占位卡片渲染（仅在该段落最后一个视觉行片段底部绘制）
+                if let imageSpec = attrs[.benImageAttachment] as? BenImageLayoutSpec {
+                    let fragChars = layoutManager.characterRange(forGlyphRange: lineGlyphRange, actualGlyphRange: nil)
+                    let ns = storage.string as NSString
+                    let paraRange = ns.lineRange(for: NSRange(location: fragChars.location, length: 0))
+                    let hasNewline = paraRange.length > 0 && ns.character(at: paraRange.location + paraRange.length - 1) == 10
+                    let contentEnd = paraRange.location + paraRange.length - (hasNewline ? 1 : 0)
+
+                    if fragChars.location + fragChars.length >= contentEnd {
+                        let totalImgHeight = imageSpec.totalBlockHeight(availableWidth: contentWidth)
+                        var currentY = viewLineRect.maxY - totalImgHeight
+                        for item in imageSpec.items {
+                            let itemHeight = BenImageLayoutSpec.itemHeight(for: item, availableWidth: contentWidth)
+                            drawImageItem(
+                                item,
+                                in: NSRect(x: contentLeft, y: currentY, width: contentWidth, height: itemHeight)
+                            )
+                            currentY += itemHeight
+                        }
+                    }
+                }
+            } else {
+                flushCodeBlock()
+            }
+
+            glyphIndex = max(glyphIndex + 1, lineGlyphRange.location + lineGlyphRange.length)
+        }
+
+        flushCodeBlock()
+    }
+
+    private func drawImageItem(_ item: BenRenderedImageItem, in slotRect: NSRect) {
+        switch item.state {
+        case let .loaded(image, pixelSize):
+            let fitted = BenImageLayoutSpec.displaySize(
+                for: pixelSize,
+                preferredMaxWidth: item.preferredMaxWidth,
+                availableWidth: slotRect.width
+            )
+            let imageRect = NSRect(
+                x: slotRect.minX,
+                y: slotRect.minY + 6,
+                width: fitted.width,
+                height: fitted.height
+            )
+
+            NSGraphicsContext.saveGraphicsState()
+            let clipPath = NSBezierPath(roundedRect: imageRect, xRadius: 6, yRadius: 6)
+            clipPath.addClip()
+            image.draw(
+                in: imageRect,
+                from: .zero,
+                operation: .sourceOver,
+                fraction: 1.0,
+                respectFlipped: true,
+                hints: [.interpolation: NSImageInterpolation.high]
+            )
+            NSGraphicsContext.restoreGraphicsState()
+
+            let borderPath = NSBezierPath(roundedRect: imageRect, xRadius: 6, yRadius: 6)
+            NSColor.black.withAlphaComponent(0.08).setStroke()
+            borderPath.lineWidth = 1
+            borderPath.stroke()
+
+            let caption = item.alt.isEmpty ? (item.title ?? "") : item.alt
+            if !caption.isEmpty {
+                let captionAttrs: [NSAttributedString.Key: Any] = [
+                    .font: NSFont.systemFont(ofSize: 11.5),
+                    .foregroundColor: NSColor.secondaryLabelColor
+                ]
+                let nsCaption = caption as NSString
+                let captionSize = nsCaption.size(withAttributes: captionAttrs)
+                let captionX = imageRect.minX + max(0, (imageRect.width - min(imageRect.width, captionSize.width)) / 2)
+                let captionRect = NSRect(
+                    x: captionX,
+                    y: imageRect.maxY + 4,
+                    width: min(slotRect.width, captionSize.width + 4),
+                    height: 16
+                )
+                nsCaption.draw(with: captionRect, options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine], attributes: captionAttrs)
+            }
+
+        case .loading, .missing:
+            let cardRect = NSRect(
+                x: slotRect.minX,
+                y: slotRect.minY + 6,
+                width: min(slotRect.width, 420),
+                height: 40
+            )
+            let cardPath = NSBezierPath(roundedRect: cardRect, xRadius: 7, yRadius: 7)
+            NSColor.black.withAlphaComponent(0.032).setFill()
+            cardPath.fill()
+            NSColor.black.withAlphaComponent(0.10).setStroke()
+            cardPath.lineWidth = 1
+            cardPath.stroke()
+
+            let statusPrefix = item.state == .loading ? "正在加载图片" : "未找到图片"
+            let label = item.alt.isEmpty ? item.source : "\(item.alt)（\(item.source)）"
+            let display = "\(statusPrefix)：\(label)" as NSString
+            let textAttrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 12),
+                .foregroundColor: NSColor.secondaryLabelColor
+            ]
+            let textRect = NSRect(
+                x: cardRect.minX + 12,
+                y: cardRect.minY + 11,
+                width: cardRect.width - 24,
+                height: 18
+            )
+            display.draw(with: textRect, options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine], attributes: textAttrs)
         }
     }
 
@@ -644,13 +1177,12 @@ private final class BenEditorTextView: NSTextView {
 
         let lineRange = ns.lineRange(for: NSRange(location: charIndex, length: 0))
         let line = ns.substring(with: lineRange)
-        guard let regex = try? NSRegularExpression(pattern: #"^\s*[-*+]\s+(\[[ xX]\])"#),
+        guard let regex = try? NSRegularExpression(pattern: #"^[ \t]*[-*+][ \t]+(\[[ xX]\])"#),
               let match = regex.firstMatch(in: line, range: NSRange(location: 0, length: (line as NSString).length)) else {
             return false
         }
         let boxInLine = match.range(at: 1)
         let boxGlobal = NSRange(location: lineRange.location + boxInLine.location, length: boxInLine.length)
-        // 仅当点击落在 `[ ]` 附近字符时触发切换
         guard charIndex >= boxGlobal.location && charIndex <= boxGlobal.location + boxGlobal.length else {
             return false
         }

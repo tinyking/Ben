@@ -45,7 +45,8 @@ enum MarkdownFormatAction: Equatable {
     case divider
 }
 
-/// 当前打开笔记的编辑状态（MVVM 中的 ViewModel）。
+/// 当前打开笔记的编辑状态（MVVM 中的 ViewModel）：
+/// `frontmatter` 与纯 Markdown 正文 `text` 分离持有，加载时自动解耦，保存时无损拼回。
 @Observable
 final class EditorState {
     struct ScrollRequest: Equatable {
@@ -79,7 +80,11 @@ final class EditorState {
     }
 
     var currentNote: URL?
+    /// 剥离了头部 YAML Frontmatter 后的纯 Markdown 正文。
     var text: String = ""
+    /// 文档头部的 YAML Frontmatter（无 Frontmatter 时为 `nil`）。
+    var frontmatter: FrontmatterDocument?
+    var isFrontmatterExpanded = false
     var isDirty = false
     var mode: EditorMode = .wysiwyg
     var errorMessage: String?
@@ -104,8 +109,24 @@ final class EditorState {
         currentNote?.deletingPathExtension().lastPathComponent ?? "未打开笔记"
     }
 
+    var frontmatterLineOffset: Int {
+        frontmatter?.lineOffset ?? 0
+    }
+
+    /// 拼回头部 Frontmatter 后的完整磁盘 `.md` 文本。
+    var fullDocumentText: String {
+        FrontmatterParser.compose(frontmatter: frontmatter, body: text)
+    }
+
+    @ObservationIgnored private var countCacheKey = ""
+    @ObservationIgnored private var countCacheValue = 0
+
     var nonWhitespaceCount: Int {
-        text.filter { !$0.isWhitespace }.count
+        if countCacheKey == text { return countCacheValue }
+        let value = text.filter { !$0.isWhitespace }.count
+        countCacheKey = text
+        countCacheValue = value
+        return value
     }
 
     var estimatedReadingMinutes: Int {
@@ -119,18 +140,25 @@ final class EditorState {
         if currentNote == url && isDirty { return false }
         do {
             let content = try String(contentsOf: url, encoding: .utf8)
-            currentNote = url
-            text = content
-            isDirty = false
-            errorMessage = nil
-            cursorLine = 1
-            cursorColumn = 1
-            recomputeFindMatches(resetIndex: true)
+            applyLoadedContent(content, url: url)
             return true
         } catch {
             errorMessage = "无法打开「\(url.lastPathComponent)」：\(error.localizedDescription)"
             return false
         }
+    }
+
+    func applyLoadedContent(_ content: String, url: URL? = nil) {
+        let parsed = FrontmatterParser.parse(content)
+        currentNote = url
+        frontmatter = parsed.frontmatter
+        isFrontmatterExpanded = false
+        text = parsed.body
+        isDirty = false
+        errorMessage = nil
+        cursorLine = 1
+        cursorColumn = 1
+        recomputeFindMatches(resetIndex: true)
     }
 
     func updateTextFromUser(_ value: String) {
@@ -140,6 +168,43 @@ final class EditorState {
         if !findQuery.isEmpty {
             recomputeFindMatches(resetIndex: false)
         }
+        scheduleAutosave()
+    }
+
+    // MARK: - Frontmatter 属性栏编辑
+
+    func updateFrontmatterField(id: UUID, key: String, value: String) {
+        guard var doc = frontmatter,
+              let idx = doc.fields.firstIndex(where: { $0.id == id }) else { return }
+        guard doc.fields[idx].key != key || doc.fields[idx].value != value else { return }
+        doc.fields[idx].key = key
+        doc.fields[idx].value = value
+        doc.isModified = true
+        frontmatter = doc
+        isDirty = true
+        scheduleAutosave()
+    }
+
+    func addFrontmatterField(key: String = "属性", value: String = "") {
+        guard var doc = frontmatter else { return }
+        doc.fields.append(FrontmatterField(key: key, value: value))
+        doc.isModified = true
+        frontmatter = doc
+        isFrontmatterExpanded = true
+        isDirty = true
+        scheduleAutosave()
+    }
+
+    func removeFrontmatterField(id: UUID) {
+        guard var doc = frontmatter else { return }
+        doc.fields.removeAll { $0.id == id }
+        doc.isModified = true
+        frontmatter = doc
+        isDirty = true
+        scheduleAutosave()
+    }
+
+    private func scheduleAutosave() {
         autosaveWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in _ = self?.save() }
         autosaveWorkItem = work
@@ -268,30 +333,39 @@ final class EditorState {
         )
     }
 
-    // MARK: - 文档大纲（自动忽略代码块内的 # 注释）
+    // MARK: - 文档大纲（仅扫描剥离 Frontmatter 后的正文，且精确跳过任意长度围栏代码块）
+
+    // 光标每次移动都会触发右侧大纲重绘；若不缓存，417 行长文会被重复全篇扫描 3 次以上。
+    // 用 @ObservationIgnored 避免缓存写入本身再次触发 SwiftUI 更新。
+    @ObservationIgnored private var outlineCacheKey = ""
+    @ObservationIgnored private var outlineCache: [OutlineEntry] = []
 
     var outline: [OutlineEntry] {
-        var insideFence = false
+        if outlineCacheKey == text { return outlineCache }
+        let lines = text.components(separatedBy: "\n")
+        let codeStates = MarkdownStyler.computeCodeBlockLineStates(in: lines)
         var entries: [OutlineEntry] = []
-        for (index, line) in text.components(separatedBy: "\n").enumerated() {
-            let trimmed = line.drop(while: { $0 == " " || $0 == "\t" })
-            if trimmed.hasPrefix("```") {
-                insideFence.toggle()
-                continue
-            }
-            if insideFence { continue }
+
+        for (index, line) in lines.enumerated() where codeStates[index] == .none {
+            let trimmed = line.drop(while: { $0 == " " })
+            guard line.prefix(while: { $0 == " " }).count <= 3 else { continue }
             let level = trimmed.prefix(while: { $0 == "#" }).count
             guard (1...6).contains(level),
                   trimmed.count > level,
                   trimmed.dropFirst(level).first?.isWhitespace == true else { continue }
-            let title = trimmed.dropFirst(level).drop(while: { $0.isWhitespace })
+            var title = String(trimmed.dropFirst(level).drop(while: { $0.isWhitespace }))
+            if let closingRange = title.range(of: #"[ \t]+#+[ \t]*$"#, options: .regularExpression) {
+                title.removeSubrange(closingRange)
+            }
             guard !title.isEmpty else { continue }
-            entries.append(OutlineEntry(line: index + 1, level: level, title: String(title)))
+            entries.append(OutlineEntry(line: index + 1, level: level, title: title))
         }
+        outlineCacheKey = text
+        outlineCache = entries
         return entries
     }
 
-    // MARK: - 保存与同步
+    // MARK: - 保存与同步（自动将 Frontmatter 原样或结构化拼回文件头部）
 
     @discardableResult
     func save() -> Bool {
@@ -299,7 +373,7 @@ final class EditorState {
         autosaveWorkItem?.cancel()
         autosaveWorkItem = nil
         do {
-            try text.write(to: url, atomically: true, encoding: .utf8)
+            try fullDocumentText.write(to: url, atomically: true, encoding: .utf8)
             isDirty = false
             errorMessage = nil
             onDidSave?()
@@ -321,8 +395,10 @@ final class EditorState {
     func reloadFromDiskIfNeeded() {
         guard let url = currentNote, !isDirty else { return }
         guard let diskText = try? String(contentsOf: url, encoding: .utf8) else { return }
-        if diskText != text {
-            text = diskText
+        if diskText != fullDocumentText {
+            let parsed = FrontmatterParser.parse(diskText)
+            frontmatter = parsed.frontmatter
+            text = parsed.body
             highlightedLine = nil
             recomputeFindMatches(resetIndex: false)
         }
@@ -332,6 +408,8 @@ final class EditorState {
         autosaveWorkItem?.cancel()
         autosaveWorkItem = nil
         currentNote = nil
+        frontmatter = nil
+        isFrontmatterExpanded = false
         text = ""
         isDirty = false
         highlightedLine = nil
@@ -342,7 +420,7 @@ final class EditorState {
     }
 }
 
-struct OutlineEntry: Identifiable {
+struct OutlineEntry: Identifiable, Equatable {
     let line: Int
     let level: Int
     let title: String

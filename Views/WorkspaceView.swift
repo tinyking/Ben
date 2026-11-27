@@ -6,18 +6,26 @@ struct WorkspaceView: View {
     @State private var pendingClose = false
     @State private var renameDraft = ""
 
+    private static let inkCharcoal = Color(red: 0x1D / 255.0, green: 0x1D / 255.0, blue: 0x1F / 255.0)
+
     var body: some View {
         VStack(spacing: 0) {
+            paperToolbar
             if app.editor.currentNote == nil {
                 emptyState
             } else {
                 MarkdownEditorView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 statusBar
             }
         }
-        .frame(minWidth: 440, minHeight: 340)
-        .navigationTitle(app.editor.displayName)
-        .navigationSubtitle(noteSubtitle)
+        .padding(.horizontal, 22)
+        .padding(.vertical, 16)
+        .frame(minWidth: 500, minHeight: 360)
+        .background(Color.white)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .shadow(color: .black.opacity(0.3), radius: 24, y: 8)
+        .environment(\.colorScheme, .light)
         .background(WindowCloseGuard(
             isDirty: app.editor.isDirty,
             onCloseAttempt: { pendingClose = true }
@@ -52,6 +60,75 @@ struct WorkspaceView: View {
         } message: {
             Text("「\(app.editor.displayName)」尚未保存，是否保存后再关闭？")
         }
+    }
+
+    private var paperToolbar: some View {
+        HStack(alignment: .center, spacing: 16) {
+            HStack(spacing: 18) {
+                ForEach([EditorMode.wysiwyg, .source], id: \.self) { mode in
+                    Button { app.editor.mode = mode } label: {
+                        VStack(spacing: 7) {
+                            Text(mode == .wysiwyg ? "所见即所得" : "源码")
+                                .font(.system(size: 12, weight: app.editor.mode == mode ? .semibold : .regular))
+                                .foregroundStyle(app.editor.mode == mode ? Self.inkCharcoal : Color.secondary)
+                            Capsule().fill(app.editor.mode == mode ? Self.inkCharcoal : .clear).frame(height: 2)
+                        }
+                        .fixedSize(horizontal: true, vertical: false)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(app.editor.currentNote == nil)
+                }
+            }
+            Spacer(minLength: 10)
+            Text(app.editor.displayName)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            Spacer(minLength: 10)
+            Button { app.presentOverlay(.findReplace) } label: {
+                Image(systemName: "text.magnifyingglass")
+            }
+            .buttonStyle(.plain).help("文内查找与替换 (⌘F)")
+            .disabled(app.editor.currentNote == nil)
+            Button(action: exportPDF) {
+                Image(systemName: "square.and.arrow.up")
+            }
+            .buttonStyle(.plain).help("导出 PDF")
+            .disabled(app.editor.currentNote == nil)
+            Button { app.createNoteInCurrentFolder() } label: {
+                Text("新建")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 14).padding(.vertical, 7)
+                    .background(Self.inkCharcoal, in: Capsule())
+            }
+            .buttonStyle(.plain).help("新建笔记 (⌘N)")
+        }
+        .padding(.horizontal, 2)
+        .padding(.top, 3)
+        .padding(.bottom, 10)
+        .overlay(alignment: .bottom) { Rectangle().fill(Color.black.opacity(0.08)).frame(height: 1) }
+    }
+
+    private func exportPDF() {
+        guard let noteURL = app.editor.currentNote else { return }
+        // 直接打印编辑器当前渲染出的视图，而不是用系统 Markdown 解析器从源码重新生成：
+        // 后者会丢掉所见即所得下的隐藏语法、圆点列表、分割线、代码块底板与 frontmatter 属性栏。
+        guard let editorView = BenEditorViewRegistry.current else {
+            app.editor.errorMessage = "无法导出 PDF：编辑器尚未就绪，请稍后再试。"
+            return
+        }
+        let printInfo = (NSPrintInfo.shared.copy() as? NSPrintInfo) ?? NSPrintInfo.shared
+        printInfo.topMargin = 36
+        printInfo.bottomMargin = 36
+        printInfo.leftMargin = 36
+        printInfo.rightMargin = 36
+
+        let operation = NSPrintOperation(view: editorView, printInfo: printInfo)
+        operation.jobTitle = noteURL.deletingPathExtension().lastPathComponent
+        operation.showsPrintPanel = true
+        operation.showsProgressPanel = true
+        operation.run()
     }
 
     private var noteSubtitle: String {
@@ -95,8 +172,8 @@ struct WorkspaceView: View {
         .foregroundStyle(.secondary)
         .padding(.horizontal, 18)
         .padding(.vertical, 6)
-        .background(.bar)
-        .overlay(alignment: .top) { Divider() }
+        .background(Color.clear)
+        .overlay(alignment: .top) { Rectangle().fill(Color.black.opacity(0.07)).frame(height: 1) }
         .animation(.easeInOut(duration: 0.2), value: app.editor.isDirty)
     }
 
@@ -113,17 +190,26 @@ struct WorkspaceView: View {
                     app.createNoteInCurrentFolder()
                 } label: {
                     Label("新建笔记 (⌘N)", systemImage: "square.and.pencil")
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 15)
+                        .padding(.vertical, 8)
+                        .background(Self.inkCharcoal, in: Capsule())
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.regular)
+                .buttonStyle(.plain)
 
                 Button {
                     app.presentOverlay(.quickSwitcher)
                 } label: {
                     Label("快速打开 (⌘O)", systemImage: "magnifyingglass")
+                        .font(.callout.weight(.medium))
+                        .foregroundStyle(Self.inkCharcoal.opacity(0.84))
+                        .padding(.horizontal, 15)
+                        .padding(.vertical, 8)
+                        .background(Color.black.opacity(0.05), in: Capsule())
+                        .overlay(Capsule().stroke(Color.black.opacity(0.12), lineWidth: 1))
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.regular)
+                .buttonStyle(.plain)
             }
             .padding(.top, 2)
         }
