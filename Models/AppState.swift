@@ -9,6 +9,18 @@ enum ActiveOverlay: Equatable {
     case outline
 }
 
+enum NoteSortOrder: String, CaseIterable {
+    case modifiedDate
+    case title
+
+    var label: String {
+        switch self {
+        case .modifiedDate: return "按修改时间"
+        case .title: return "按标题名称"
+        }
+    }
+}
+
 /// 应用级状态：把仓库、编辑、搜索与浮层状态统一串联。
 @Observable
 final class AppState {
@@ -19,6 +31,13 @@ final class AppState {
     var activeOverlay: ActiveOverlay?
     var isRenamingCurrentNote = false
     var currentFolderURL: URL?
+    var noteSortOrder: NoteSortOrder = .modifiedDate
+
+    static func isSameDirectory(_ lhs: URL?, _ rhs: URL?) -> Bool {
+        guard let lhs, let rhs else { return false }
+        return lhs.resolvingSymlinksInPath().standardizedFileURL.path
+            == rhs.resolvingSymlinksInPath().standardizedFileURL.path
+    }
 
     // 注意：@Observable 类里直接读写 UserDefaults，避免与宏合成冲突。
     var vaultPath: String {
@@ -27,6 +46,8 @@ final class AppState {
     }
 
     private(set) var recentVaultPaths: [String] = []
+    /// 视图重建可能让 onAppear 多次触发，启动扫描必须只执行一次。
+    private var didBootstrap = false
 
     var recentVaultURLs: [URL] {
         recentVaultPaths
@@ -55,10 +76,17 @@ final class AppState {
     }
 
     func bootstrap() {
+        guard !didBootstrap else { return }
+        didBootstrap = true
         guard !vaultPath.isEmpty else { return }
         let url = URL(fileURLWithPath: vaultPath)
-        if !vaultStore.open(url: url) {
+        guard Vault.isValid(url) else {
             vaultPath = ""
+            return
+        }
+        // 与「选择文件夹」共用同一套异步扫描路径，避免两套逻辑互相覆盖状态。
+        DispatchQueue.main.async { [weak self] in
+            _ = self?.vaultStore.open(url: url)
         }
     }
 
@@ -122,7 +150,7 @@ final class AppState {
         if !preserveFolder, FileManager.default.fileExists(atPath: url.path) {
             // 若当前处于「所有笔记」视图，保持「所有笔记」不强制跳目录；否则同步到所属文件夹
             if let root = vaultStore.vaultURL,
-               currentFolderURL?.standardizedFileURL != root.standardizedFileURL {
+               !Self.isSameDirectory(currentFolderURL, root) {
                 currentFolderURL = url.deletingLastPathComponent()
             }
         }
@@ -133,6 +161,35 @@ final class AppState {
         let folder = currentFolderURL ?? root
         guard let url = vaultStore.createNote(in: folder) else { return }
         selectNote(url, preserveFolder: true)
+    }
+
+    /// Appends a quick-capture line to the vault's canonical Inbox note.
+    func quickAppendToInbox(_ rawText: String, createIfMissing: Bool = false) {
+        guard let root = vaultStore.vaultURL else { return }
+        let content = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !content.isEmpty || createIfMissing else { return }
+        let inboxURL = vaultStore.allNotes().first(where: { $0.name == "00 Inbox.md" })?.url
+            ?? root.appendingPathComponent("00 Inbox.md")
+        do {
+            if !FileManager.default.fileExists(atPath: inboxURL.path) {
+                try "".write(to: inboxURL, atomically: true, encoding: .utf8)
+            }
+            if !content.isEmpty {
+                let isOpenInbox = editor.currentNote?.standardizedFileURL == inboxURL.standardizedFileURL
+                var existing = isOpenInbox ? editor.text : ((try? String(contentsOf: inboxURL, encoding: .utf8)) ?? "")
+                if !existing.isEmpty && !existing.hasSuffix("\n") { existing += "\n" }
+                existing += content + "\n"
+                if isOpenInbox {
+                    editor.updateTextFromUser(existing)
+                    _ = editor.save()
+                } else {
+                    try existing.write(to: inboxURL, atomically: true, encoding: .utf8)
+                }
+            }
+            vaultStore.refresh()
+        } catch {
+            editor.errorMessage = "追加到 Inbox 失败：\(error.localizedDescription)"
+        }
     }
 
     func createFolderInCurrentLocation(parent: URL? = nil) {
@@ -191,13 +248,22 @@ final class AppState {
 
     func jump(to hit: SearchHit) {
         selectNote(hit.url, preserveFolder: true)
+        let offset = editor.frontmatterLineOffset
+        if offset > 0 && hit.lineNumber <= offset {
+            editor.isFrontmatterExpanded = true
+            editor.highlightedLine = nil
+            editor.highlightedQuery = ""
+            dismissOverlay()
+            return
+        }
+        let bodyLine = max(1, hit.lineNumber - offset)
         let nsLine = hit.line as NSString
         let matchNSRange = NSRange(hit.matchRange, in: hit.line)
-        editor.highlightedLine = hit.lineNumber
+        editor.highlightedLine = bodyLine
         editor.highlightedQuery = search.query
         editor.scrollRequest = EditorState.ScrollRequest(
             url: hit.url,
-            line: hit.lineNumber,
+            line: bodyLine,
             column: matchNSRange.location != NSNotFound ? matchNSRange.location : 0,
             length: matchNSRange.location != NSNotFound ? min(matchNSRange.length, nsLine.length) : 0,
             showFindIndicator: true

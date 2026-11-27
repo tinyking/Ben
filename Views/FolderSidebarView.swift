@@ -23,7 +23,7 @@ struct FolderSidebarView: View {
                         Spacer(minLength: 6)
                         Text("\(app.vaultStore.totalNoteCount)")
                             .font(.caption)
-                            .foregroundStyle(.tertiary)
+                            .foregroundStyle(.white.opacity(0.56))
                             .monospacedDigit()
                     }
                     .tag(root)
@@ -47,7 +47,7 @@ struct FolderSidebarView: View {
                 if folders.isEmpty {
                     Text("尚无子文件夹")
                         .font(.caption)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.white.opacity(0.45))
                 } else {
                     OutlineGroup(folders, children: \.children) { folder in
                         folderRow(folder)
@@ -57,6 +57,7 @@ struct FolderSidebarView: View {
             } header: {
                 HStack {
                     Text("文件夹")
+                        .foregroundStyle(.white.opacity(0.5))
                     Spacer()
                     Button {
                         app.createFolderInCurrentLocation(parent: app.vaultStore.vaultURL)
@@ -65,12 +66,17 @@ struct FolderSidebarView: View {
                             .font(.caption)
                     }
                     .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.white.opacity(0.6))
                     .help("新建文件夹 (⌘⇧N)")
                 }
             }
         }
         .listStyle(.sidebar)
+        .scrollContentBackground(.hidden)
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            Color.clear.frame(height: 8)
+        }
+        .foregroundStyle(.white.opacity(0.86))
         .onAppear {
             if app.currentFolderURL == nil {
                 app.currentFolderURL = app.vaultStore.vaultURL
@@ -116,7 +122,7 @@ struct FolderSidebarView: View {
             if folder.directNoteCount > 0 {
                 Text("\(folder.directNoteCount)")
                     .font(.caption)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.white.opacity(0.56))
                     .monospacedDigit()
             }
         }

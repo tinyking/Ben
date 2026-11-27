@@ -19,6 +19,12 @@ final class VaultStore {
     private var watchers: [URL: DispatchSourceFileSystemObject] = [:]
     private var debounceTimer: DispatchSourceTimer?
     private let fsQueue = DispatchQueue(label: "com.ben.vault.fs", qos: .utility)
+    /// 扫描串行化：同一时刻只允许一次文件树构建，期间的新请求合并为一次重扫。
+    private var isScanning = false
+    private var needsRescan = false
+    private var refreshScheduled = false
+    private var watchersActive = false
+    private var watchersArmedAt: Date = .distantPast
 
     var vault: Vault? { vaultURL.map(Vault.init(url:)) }
 
@@ -47,8 +53,9 @@ final class VaultStore {
         stopWatching()
         vaultURL = url
         errorMessage = nil
-        rebuildTree()
+        // 仓库切换立即持久化并同步选中目录，不依赖后台扫描结果。
         onVaultChanged?(url)
+        rebuildTree()
         return true
     }
 
@@ -106,8 +113,9 @@ final class VaultStore {
     /// 获取指定目录下的笔记列表；若传入根目录或 nil，则返回全库所有笔记。
     func notes(in folderURL: URL?) -> [NoteFile] {
         guard let root = vaultURL else { return [] }
-        let target = (folderURL ?? root).standardizedFileURL
-        if target == root.standardizedFileURL {
+        let target = folderURL ?? root
+        if target.resolvingSymlinksInPath().standardizedFileURL.path
+            == root.resolvingSymlinksInPath().standardizedFileURL.path {
             return allNotes()
         }
         guard let folderNode = node(for: target) else { return [] }
@@ -115,16 +123,43 @@ final class VaultStore {
         return Self.sortNotesByModifiedDate(directNotes)
     }
 
+    /// 串行化后台构建文件树：同一时刻只允许一次扫描，期间的新请求合并为一次重扫，
+    /// 避免监听器事件风暴导致多份并发扫描互相丢弃结果、界面始终为空。
     private func rebuildTree() {
         guard let root = vaultURL else {
             tree = []
             totalNoteCount = 0
+            needsRescan = false
             return
         }
-        let built = Self.buildNodes(at: root)
-        tree = built
-        totalNoteCount = Self.countAllNotes(in: built)
-        installWatchers()
+        if isScanning {
+            needsRescan = true
+            return
+        }
+        isScanning = true
+        DispatchQueue.global(qos: .utility).async {
+            let snapshot = Self.makeTreeSnapshot(at: root)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.isScanning = false
+                // 仓库未变则一定落地快照；若扫描途中切换了本子，交给后续重扫。
+                if self.vaultURL == root {
+                    self.tree = snapshot.0
+                    self.totalNoteCount = snapshot.1
+                    self.installWatchers()
+                }
+                if self.needsRescan {
+                    self.needsRescan = false
+                    self.rebuildTree()
+                }
+            }
+        }
+    }
+
+    /// 在后台线程构建仓库快照，避免扫描阻塞主线程导致鼠标持续转圈。
+    static func makeTreeSnapshot(at root: URL) -> ([NoteFile], Int) {
+        let built = buildNodes(at: root)
+        return (built, countAllNotes(in: built))
     }
 
     private static func countAllNotes(in nodes: [NoteFile]) -> Int {
@@ -187,36 +222,34 @@ final class VaultStore {
         return folders.sorted(by: byName) + notes.sorted(by: byName)
     }
 
-    /// 仅剥离首行开始且有闭合标记的 YAML，再提取第一段真实正文。
+    /// 仅剥离首行开始且有闭合标记的合法 YAML Frontmatter，跳过封面/纯图片行，提取第一段真实正文摘要。
     private static func extractPreviewText(from url: URL) -> String {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return "无附加文本" }
         defer { try? handle.close() }
         guard let data = try? handle.read(upToCount: 16_384) else { return "无附加文本" }
-        var lines = String(decoding: data, as: UTF8.self).components(separatedBy: .newlines)
+        let rawText = String(decoding: data, as: UTF8.self)
+        return extractPreviewSummary(from: rawText)
+    }
 
-        // YAML front matter is recognized only when line 1 is exactly `---`
-        // and a matching exact delimiter closes it. Other separators are content.
-        if lines.first == "---", let closing = lines.dropFirst().firstIndex(of: "---") {
-            lines.removeSubrange(0...closing)
-        }
+    static func extractPreviewSummary(from rawText: String) -> String {
+        let body = FrontmatterParser.parse(rawText).body
+        let lines = body.components(separatedBy: .newlines)
+        let codeStates = MarkdownStyler.computeCodeBlockLineStates(in: lines)
 
-        var inCodeBlock = false
         var paragraph: [String] = []
-        for rawLine in lines {
-            let trimmed = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.hasPrefix("```") {
+        for (idx, rawLine) in lines.enumerated() {
+            if codeStates[idx] != .none {
                 if !paragraph.isEmpty { break }
-                inCodeBlock.toggle()
                 continue
             }
-            if inCodeBlock { continue }
+            let trimmed = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty {
                 if !paragraph.isEmpty { break }
                 continue
             }
             if trimmed.range(of: #"^#{1,6}(?:\s|$)"#, options: .regularExpression) != nil
                 || trimmed.hasPrefix("<!--")
-                || trimmed == "---" || trimmed == "***" || trimmed == "___" {
+                || MarkdownStyler.isHorizontalRuleLine(rawLine) {
                 if !paragraph.isEmpty { break }
                 continue
             }
@@ -228,21 +261,50 @@ final class VaultStore {
                 .trimmingCharacters(in: .whitespaces).isEmpty {
                 continue
             }
-            paragraph.append(trimmed)
+            // 摘要最多只取 240 字，超长行无需整行参与正则处理（同时限制回溯型正则的输入规模）。
+            let cleanedLine = stripMarkdownSyntax(String(trimmed.prefix(600)))
+            if cleanedLine.isEmpty {
+                continue
+            }
+            paragraph.append(cleanedLine)
         }
 
-        let cleaned = stripMarkdownSyntax(paragraph.joined(separator: " "))
-        return cleaned.isEmpty ? "无附加文本" : String(cleaned.prefix(240))
+        let joined = paragraph.joined(separator: " ")
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return joined.isEmpty ? "无附加文本" : String(joined.prefix(240))
     }
 
     private static func stripMarkdownSyntax(_ line: String) -> String {
         var s = line
         // 去掉列表/引用/待办前缀
         s = s.replacingOccurrences(of: #"^(?:>\s*)+|(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s+)?"#, with: "", options: .regularExpression)
-        // 图片 ![alt](url) -> alt
-        s = s.replacingOccurrences(of: #"!\[([^\]]*)\]\([^)]+\)"#, with: "$1", options: .regularExpression)
-        // 链接 [text](url) -> text
-        s = s.replacingOccurrences(of: #"\[([^\]]+)\]\([^)]+\)"#, with: "$1", options: .regularExpression)
+        // 去掉嵌套图片链接 [![Cover](img)](url)
+        // 注意：这里刻意使用不含嵌套量词的线性正则。
+        // 形如 (?:[^()]+|\([^()]*\))* 的写法在长行上会触发 ICU 灾难性回溯，实测单次 >20s 无法完成，
+        // 会拖垮整个文件树扫描导致界面永远加载不出笔记。
+        //
+        // 括号处理：目标地址允许一层括号平衡（如 `cover_(hero).jpg`），因此用 `(?:[^()]|\([^()]*\))*`。
+        // 该写法每个位置的两个分支按首字符互斥（括号 / 非括号），匹配唯一、无回溯歧义，仍为线性复杂度。
+        let balancedParens = #"(?:[^()]|\([^()]*\))*"#
+        s = s.replacingOccurrences(
+            of: #"\[!\[[^\]]*\]\("# + balancedParens + #"\)\]\("# + balancedParens + #"\)"#,
+            with: "", options: .regularExpression
+        )
+        // 去掉标准 Markdown 图片 ![Cover](url)（不保留 alt 以避免残留 Cover / Image）
+        s = s.replacingOccurrences(
+            of: #"!\[[^\]]*\]\("# + balancedParens + #"\)"#,
+            with: "", options: .regularExpression
+        )
+        // 去掉 Obsidian WikiLink 图片 ![[cover.png]]
+        s = s.replacingOccurrences(of: #"!\[\[[^\[\]]+\]\]"#, with: "", options: .regularExpression)
+        // 去掉 HTML <img> 标签
+        s = s.replacingOccurrences(of: #"<img\b[^>]*>"#, with: "", options: [.regularExpression, .caseInsensitive])
+        // 普通文字链接 [text](url) -> text
+        s = s.replacingOccurrences(
+            of: #"\[([^\]]+)\]\("# + balancedParens + #"\)"#,
+            with: "$1", options: .regularExpression
+        )
         // 行内标记
         s = s.replacingOccurrences(of: #"[`*~_==]+"#, with: "", options: .regularExpression)
         // 表格竖线转空格
@@ -350,7 +412,6 @@ final class VaultStore {
     // MARK: - 外部改动监听
 
     private func installWatchers() {
-        stopWatching()
         guard let root = vaultURL else { return }
 
         var directories: [URL] = [root]
@@ -361,6 +422,15 @@ final class VaultStore {
             }
         }
         collect(tree)
+
+        // 目录集合未变化时复用已有监听器，避免每次刷新都重装 800+ 个 vnode 源而自触发刷新风暴。
+        let desired = Set(directories.map { $0.standardizedFileURL })
+        let current = Set(watchers.keys.map { $0.standardizedFileURL })
+        if desired == current {
+            watchersActive = true
+            return
+        }
+        stopWatching()
 
         for directory in directories {
             let fd = directory.withUnsafeFileSystemRepresentation { path -> Int32 in
@@ -383,23 +453,36 @@ final class VaultStore {
             source.resume()
             watchers[directory] = source
         }
+        watchersActive = true
+        watchersArmedAt = Date()
     }
 
     private func scheduleRefresh() {
-        debounceTimer?.cancel()
-        let timer = DispatchSource.makeTimerSource(queue: fsQueue)
-        timer.schedule(deadline: .now() + 0.3, leeway: .milliseconds(100))
-        timer.setEventHandler { [weak self] in
-            DispatchQueue.main.async {
-                self?.rebuildTree()
-                self?.onFilesChanged?()
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.watchersActive else { return }
+            // 忽略刚安装监听器时产生的自触发事件。
+            guard Date().timeIntervalSince(self.watchersArmedAt) > 1.5 else { return }
+            guard !self.refreshScheduled else { return }
+            self.refreshScheduled = true
+            self.debounceTimer?.cancel()
+            let timer = DispatchSource.makeTimerSource(queue: self.fsQueue)
+            timer.schedule(deadline: .now() + 0.4, leeway: .milliseconds(100))
+            timer.setEventHandler { [weak self] in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.refreshScheduled = false
+                    self.rebuildTree()
+                    self.onFilesChanged?()
+                }
             }
+            timer.resume()
+            self.debounceTimer = timer
         }
-        timer.resume()
-        debounceTimer = timer
     }
 
     private func stopWatching() {
+        watchersActive = false
+        refreshScheduled = false
         debounceTimer?.cancel()
         debounceTimer = nil
         for source in watchers.values { source.cancel() }
